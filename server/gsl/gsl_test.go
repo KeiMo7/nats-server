@@ -14,6 +14,8 @@
 package gsl
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -170,9 +172,11 @@ func TestGenericSublistRemoveWithWildcardsAsLiterals(t *testing.T) {
 func TestGenericSublistMatchWithEmptyTokens(t *testing.T) {
 	s := NewSublist[struct{}]()
 	require_NoError(t, s.Insert(">", struct{}{}))
-	for _, subject := range []string{".foo", "..foo", "foo..", "foo.", "foo..bar", "foo...bar"} {
+	for _, subject := range []string{"", ".foo", "..foo", "foo..", "foo.", "foo..bar", "foo...bar"} {
 		t.Run(subject, func(t *testing.T) {
 			require_Matches(t, s, subject, 0)
+			require_False(t, s.HasInterest(subject))
+			require_Equal(t, s.NumInterest(subject), 0)
 		})
 	}
 }
@@ -232,6 +236,101 @@ func TestGenericSublistHasInterest(t *testing.T) {
 	require_True(t, s.HasInterest("foo"))
 	require_False(t, s.HasInterest("foo.bar"))
 	require_NoError(t, s.Remove("*", 66))
+}
+
+func require_Tokenization(t testing.TB, subject string) {
+	t.Helper()
+	var buf [32]string
+	got := tokenizeSubjectIntoSliceNoEmpty(buf[:0], subject)
+	want := strings.Split(subject, ".")
+	if slices.Contains(want, "") {
+		require_True(t, got == nil)
+		return
+	}
+	require_Equal(t, len(got), len(want))
+	for i, token := range want {
+		require_Equal(t, got[i], token)
+	}
+}
+
+func TestGenericSublistTokenizationBoundaries(t *testing.T) {
+	for _, subject := range []string{
+		"abcdefg", "abcdefgh", "abcdefghi",
+		"abcdefg.", "abcdefg.h", "abcdefgh.i", "abcdefg..i",
+		"abcdefg.hijklmn.", "abcdefg.hijklmn.o",
+		strings.Repeat("a.", 64) + "b", // 65 tokens exceed the 32-token buffer.
+	} {
+		t.Run(subject, func(t *testing.T) {
+			require_Tokenization(t, subject)
+		})
+	}
+}
+
+func TestGenericSublistDotMask(t *testing.T) {
+	const word uint64 = 0x2e_00_2e_2f_2e_2e_ae_2e
+	const want uint64 = 0x80_00_80_00_80_80_00_80
+	mask := subjectDotMask(word)
+	require_Equal(t, mask, want)
+	for _, index := range []int{0, 2, 3, 5, 7} {
+		require_Equal(t, firstDotIndex(mask), index)
+		mask = removeFirstDot(mask)
+	}
+	require_Equal(t, mask, 0)
+}
+
+func TestGenericSublistTokenizationBytePairs(t *testing.T) {
+	suffix := strings.Repeat("b", 16)
+	for offset := range 8 {
+		prefix := strings.Repeat("a", offset+1)
+		for value := range 256 {
+			neighbor := string([]byte{byte(value)})
+			require_Tokenization(t, prefix+"."+neighbor+suffix)
+			require_Tokenization(t, prefix+neighbor+"."+suffix)
+		}
+	}
+}
+
+func FuzzGenericSublistTokenization(f *testing.F) {
+	for _, subject := range []string{"", "a", "a.b", ".a", "a.", "a..b", "*", "foo.>", strings.Repeat("a.", 64) + "b", strings.Repeat("a", 129), "a.\x00.\xff"} {
+		f.Add(subject)
+	}
+	f.Fuzz(func(t *testing.T, subject string) {
+		require_Tokenization(t, subject)
+	})
+}
+
+func BenchmarkGenericSublistTokenizeSubject(b *testing.B) {
+	for _, count := range []int{1, 2, 4, 8, 16, 32, 64} {
+		for _, length := range []int{1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64} {
+			b.Run(fmt.Sprintf("tokens=%d/bytes=%d", count, length), func(b *testing.B) {
+				token := strings.Repeat("a", length)
+				subject := strings.Repeat(token+".", count-1) + token
+				b.ReportAllocs()
+				for b.Loop() {
+					var buf [32]string
+					tokenizeSubjectIntoSliceNoEmpty(buf[:0], subject)
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkGenericSublistTokenizeSubjectMixedLengths(b *testing.B) {
+	pattern := [...]string{"a", strings.Repeat("a", 36)}
+	for _, count := range []int{3, 4, 16, 32, 64} {
+		b.Run(fmt.Sprintf("alternating/tokens=%d", count), func(b *testing.B) {
+			tokens := make([]string, count)
+			for i := range tokens {
+				tokens[i] = pattern[i%len(pattern)]
+			}
+			subject := strings.Join(tokens, ".")
+			b.ReportAllocs()
+			for b.Loop() {
+				var buf [32]string
+				tokenizeSubjectIntoSliceNoEmpty(buf[:0], subject)
+			}
+		})
+	}
 }
 
 func TestGenericSublistHasInterestOverlapping(t *testing.T) {

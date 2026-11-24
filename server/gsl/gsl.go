@@ -14,7 +14,9 @@
 package gsl
 
 import (
+	"encoding/binary"
 	"errors"
+	"math/bits"
 	"strings"
 	"sync"
 )
@@ -232,21 +234,10 @@ func singleFilter[T comparable](l *level[T], filter string) (string, bool) {
 
 func (s *GenericSublist[T]) match(subject string, cb func(T), doLock bool) {
 	tsa := [32]string{}
-	tokens := tsa[:0]
-	start := 0
-	for i := 0; i < len(subject); i++ {
-		if subject[i] == btsep {
-			if i-start == 0 {
-				return
-			}
-			tokens = append(tokens, subject[start:i])
-			start = i + 1
-		}
-	}
-	if start >= len(subject) {
+	tokens := tokenizeSubjectIntoSliceNoEmpty(tsa[:0], subject)
+	if tokens == nil {
 		return
 	}
-	tokens = append(tokens, subject[start:])
 
 	if doLock {
 		s.RLock()
@@ -257,21 +248,10 @@ func (s *GenericSublist[T]) match(subject string, cb func(T), doLock bool) {
 
 func (s *GenericSublist[T]) hasInterest(subject string, doLock bool, np *int) bool {
 	tsa := [32]string{}
-	tokens := tsa[:0]
-	start := 0
-	for i := 0; i < len(subject); i++ {
-		if subject[i] == btsep {
-			if i-start == 0 {
-				return false
-			}
-			tokens = append(tokens, subject[start:i])
-			start = i + 1
-		}
-	}
-	if start >= len(subject) {
+	tokens := tokenizeSubjectIntoSliceNoEmpty(tsa[:0], subject)
+	if tokens == nil {
 		return false
 	}
-	tokens = append(tokens, subject[start:])
 
 	if doLock {
 		s.RLock()
@@ -563,4 +543,59 @@ func tokenizeSubjectIntoSlice(tts []string, subject string) []string {
 	}
 	tts = append(tts, subject[start:])
 	return tts
+}
+
+// tokenizeSubjectIntoSliceNoEmpty appends tokens from subject, returning nil if any token is empty.
+func tokenizeSubjectIntoSliceNoEmpty(tokens []string, subject string) []string {
+	data := []byte(subject)
+	start, offset := 0, 0
+	for len(data)-offset >= 8 {
+		word := binary.LittleEndian.Uint64(data[offset : offset+8])
+		for mask := subjectDotMask(word); mask != 0; mask = removeFirstDot(mask) {
+			end := offset + firstDotIndex(mask)
+			if end == start {
+				return nil
+			}
+			tokens = append(tokens, subject[start:end])
+			start = end + 1
+		}
+		offset += 8
+	}
+	for i := offset; i < len(subject); i++ {
+		if subject[i] == btsep {
+			if i == start {
+				return nil
+			}
+			tokens = append(tokens, subject[start:i])
+			start = i + 1
+		}
+	}
+	if start >= len(subject) {
+		return nil
+	}
+	return append(tokens, subject[start:])
+}
+
+// firstDotIndex returns the byte index of the first dot in a nonzero mask.
+func firstDotIndex(mask uint64) int {
+	return bits.TrailingZeros64(mask) / 8
+}
+
+// removeFirstDot clears the lowest set bit, which marks the first dot.
+func removeFirstDot(mask uint64) uint64 {
+	return mask & (mask - 1)
+}
+
+// subjectDotMask returns a mask with 0b10000000 for each '.' byte in word
+// and 0b00000000 for every other byte.
+func subjectDotMask(word uint64) uint64 {
+	const highBits uint64 = 0x8080808080808080
+	const eightDots uint64 = 0x2e2e2e2e2e2e2e2e
+	// Turn each dot into a zero byte.
+	x := word ^ eightDots
+	// If any bit in a byte in x is set, the shifts set that byte's high bit.
+	x |= x << 1
+	x |= x << 2
+	x |= x << 4
+	return ^x & highBits
 }
