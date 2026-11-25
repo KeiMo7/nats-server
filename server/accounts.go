@@ -82,6 +82,9 @@ type Account struct {
 	rm           map[string]int64
 	lws          map[string]int32 // per key, last queueWeight(rm[key]) sent to routes; used to dedup sends
 	usersRevoked map[string]int64
+	// userPolicies stores the newest centrally submitted user claim policy,
+	// keyed by user public key. It is guarded by mu.
+	userPolicies map[string]*userPolicyState
 	mappings     []*mapping
 	hasMapped    atomic.Bool
 	lmu          sync.RWMutex
@@ -3322,10 +3325,19 @@ func (a *Account) expiredTimeout() {
 
 	// Collect the clients and expire them.
 	cs := a.getClients()
+	affected := 0
 	for _, c := range cs {
 		if !isInternalClient(c.kind) {
 			c.accountAuthExpired()
+			affected++
 		}
+	}
+	if affected > 0 && a.srv != nil {
+		a.srv.auditAuthzEvaluation(&AuthzAuditEvent{
+			Source: AuthzSourceAccountUpdate, Account: a.Name,
+			Reason: AuthzReasonClaimExpired, AffectedConnections: affected,
+			TerminatedConnections: affected, Terminated: true, Applied: true,
+		}, a)
 	}
 }
 
@@ -3952,6 +3964,8 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 
 	defaultPerms := a.defaultPerms
 	defaultPermsChanged := !reflect.DeepEqual(old.defaultPerms, defaultPerms)
+	policyDiff := DiffAuthzPolicies(old.defaultPerms, defaultPerms)
+	defaultPermsAffected := 0
 	a.updated = time.Now()
 	clients := a.getClientsLocked()
 	ajs := a.js
@@ -4041,6 +4055,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		}
 		c.mu.Unlock()
 		if defaultPermsChanged && c.updateDefaultPermissions(defaultPerms) && defaultPerms != nil {
+			defaultPermsAffected++
 			c.processSubsOnConfigReload(nil)
 		}
 		// Check for being revoked here. We use ac one to avoid the account lock.
@@ -4056,6 +4071,11 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 			} else if ok := ac.IsClaimRevoked(juc); ok {
 				c.sendErrAndDebug("User Authentication Revoked")
 				c.closeConnection(Revocation)
+				s.auditAuthzEvaluation(&AuthzAuditEvent{
+					Source: AuthzSourceAccountUpdate, Account: a.Name, User: juc.Subject,
+					Reason: AuthzReasonRevoked, AffectedConnections: 1,
+					TerminatedConnections: 1, Terminated: true, Applied: true,
+				}, a)
 				continue
 			}
 		}
@@ -4071,12 +4091,22 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 			if ok && seconds >= issuedAt {
 				c.sendErrAndDebug("User Authentication Revoked")
 				c.closeConnection(Revocation)
+				s.auditAuthzEvaluation(&AuthzAuditEvent{
+					Source: AuthzSourceAccountUpdate, Account: a.Name, User: nkeyUserID,
+					Reason: AuthzReasonRevoked, AffectedConnections: 1,
+					TerminatedConnections: 1, Terminated: true, Applied: true,
+				}, a)
 				continue
 			}
 			seconds, ok = ac.Revocations[nkeyUserID]
 			if ok && seconds >= issuedAt {
 				c.sendErrAndDebug("User Authentication Revoked")
 				c.closeConnection(Revocation)
+				s.auditAuthzEvaluation(&AuthzAuditEvent{
+					Source: AuthzSourceAccountUpdate, Account: a.Name, User: nkeyUserID,
+					Reason: AuthzReasonRevoked, AffectedConnections: 1,
+					TerminatedConnections: 1, Terminated: true, Applied: true,
+				}, a)
 				continue
 			}
 		}
@@ -4091,20 +4121,38 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 				continue
 			}
 			sk := c.user.SigningKey
+			userNkey := c.user.Nkey
 			c.mu.Unlock()
 			if sk == _EMPTY_ {
 				continue
 			}
 			if _, ok := alteredScope[sk]; ok {
 				c.closeConnection(AuthenticationViolation)
+				s.auditAuthzEvaluation(&AuthzAuditEvent{
+					Source: AuthzSourceAccountUpdate, Account: a.Name, User: userNkey,
+					Reason: AuthzReasonUntrustedIssuer, AffectedConnections: 1,
+					TerminatedConnections: 1, Terminated: true, Applied: true,
+				}, a)
 			} else if _, ok := a.hasIssuer(sk); !ok {
 				c.closeConnection(AuthenticationViolation)
+				s.auditAuthzEvaluation(&AuthzAuditEvent{
+					Source: AuthzSourceAccountUpdate, Account: a.Name, User: userNkey,
+					Reason: AuthzReasonUntrustedIssuer, AffectedConnections: 1,
+					TerminatedConnections: 1, Terminated: true, Applied: true,
+				}, a)
 			}
 		}
 	}
 
 	// Updating other accounts below takes their lock, so release ours first.
 	a.cmu.Unlock()
+
+	if policyDiff != nil {
+		s.auditAuthzEvaluation(&AuthzAuditEvent{
+			Source: AuthzSourceAccountUpdate, Account: a.Name,
+			AffectedConnections: defaultPermsAffected, Diff: policyDiff, Applied: true,
+		}, a)
+	}
 
 	if _, ok := s.incompleteAccExporterMap.Load(old.Name); ok && refreshImportingAccounts {
 		s.incompleteAccExporterMap.Delete(old.Name)
@@ -4690,6 +4738,9 @@ func (dr *DirAccResolver) Start(s *Server) error {
 		// As this is a raw message, we need to extract payload and only decode claims from it,
 		// in case request is sent with headers.
 		_, msg = c.msgParts(msg)
+		if _, userErr := jwt.DecodeUserClaims(string(msg)); userErr == nil {
+			return
+		}
 		if claim, err := jwt.DecodeAccountClaims(string(msg)); err != nil {
 			respondToUpdate(s, resp, "n/a", "jwt update resulted in error", err)
 		} else if claim.Issuer == op && strict {
@@ -5017,6 +5068,9 @@ func (dr *CacheDirAccResolver) Start(s *Server) error {
 		// As this is a raw message, we need to extract payload and only decode claims from it,
 		// in case request is sent with headers.
 		_, msg = c.msgParts(msg)
+		if _, userErr := jwt.DecodeUserClaims(string(msg)); userErr == nil {
+			return
+		}
 		if claim, err := jwt.DecodeAccountClaims(string(msg)); err != nil {
 			respondToUpdate(s, resp, "n/a", "jwt update cache resulted in error", err)
 		} else if claim.Issuer == op && strict {

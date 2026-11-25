@@ -1048,6 +1048,9 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			c.Debugf("Account JWT not signed by trusted operator")
 			return false
 		}
+		// A centrally applied newer user policy is authoritative before all
+		// remaining claim checks, so an old reconnect JWT cannot widen rights.
+		juc = s.reconcileConnectUserPolicy(acc, juc)
 		if scope, ok := acc.hasIssuer(juc.Issuer); !ok {
 			c.Debugf("User JWT issuer is not known")
 			return false

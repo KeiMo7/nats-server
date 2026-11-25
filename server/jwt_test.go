@@ -8978,3 +8978,288 @@ func TestApplyAccountLimitsDoesNotDisconnectAtExactSubsLimit(t *testing.T) {
 	c.mu.Unlock()
 	require_False(t, closed)
 }
+
+func TestJWTUserClaimLiveUpdateNarrowsWidensAndAudits(t *testing.T) {
+	okp, err := nkeys.FromSeed(oSeed)
+	require_NoError(t, err)
+	opPub, err := okp.PublicKey()
+	require_NoError(t, err)
+
+	sysKP, sysPub := createKey(t)
+	sysClaim := jwt.NewAccountClaims(sysPub)
+	sysJWT := encodeClaim(t, sysClaim, sysPub)
+	sysCreds := newUser(t, sysKP)
+
+	accKP, accPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(accPub)
+	accJWT := encodeClaim(t, accClaim, accPub)
+
+	resolver := &MemAccResolver{}
+	require_NoError(t, resolver.Store(sysPub, sysJWT))
+	require_NoError(t, resolver.Store(accPub, accJWT))
+
+	opts := DefaultOptions()
+	opts.TrustedKeys = []string{opPub}
+	opts.SystemAccount = sysPub
+	opts.AccountResolver = resolver
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	userKP, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	userPub, err := userKP.PublicKey()
+	require_NoError(t, err)
+	userSeed, err := userKP.Seed()
+	require_NoError(t, err)
+
+	initial := jwt.NewUserClaims(userPub)
+	initial.Permissions.Pub.Allow.Add("foo")
+	initial.Permissions.Sub.Allow.Add("foo")
+	initialJWT, err := initial.Encode(accKP)
+	require_NoError(t, err)
+	userCreds := genCredsFile(t, initialJWT, userSeed)
+
+	errCh := make(chan error, 4)
+	nc, err := nats.Connect(s.ClientURL(),
+		nats.UserCredentials(userCreds),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			select {
+			case errCh <- err:
+			default:
+			}
+		}),
+	)
+	require_NoError(t, err)
+	defer nc.Close()
+
+	msgCh := make(chan *nats.Msg, 4)
+	_, err = nc.Subscribe("foo", func(m *nats.Msg) { msgCh <- m })
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	sysNC, err := nats.Connect(s.ClientURL(), nats.UserCredentials(sysCreds))
+	require_NoError(t, err)
+	defer sysNC.Close()
+	auditSub, err := sysNC.SubscribeSync(fmt.Sprintf("$SYS.ACCOUNT.%s.AUTH.POLICY.UPDATE", accPub))
+	require_NoError(t, err)
+	require_NoError(t, sysNC.Flush())
+
+	otherNC, err := nats.Connect(s.ClientURL(), nats.UserCredentials(newUser(t, accKP)))
+	require_NoError(t, err)
+	defer otherNC.Close()
+	otherSub, err := otherNC.SubscribeSync("foo")
+	require_NoError(t, err)
+	require_NoError(t, otherNC.Flush())
+
+	narrowed := jwt.NewUserClaims(userPub)
+	narrowed.Permissions.Pub.Allow.Add("bar")
+	narrowed.Permissions.Sub.Allow.Add("bar")
+	narrowedJWT, err := narrowed.Encode(accKP)
+	require_NoError(t, err)
+	resp, err := sysNC.Request(userClaimsUpdateSubj, []byte(narrowedJWT), time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), `"code":200`)
+
+	select {
+	case perr := <-errCh:
+		require_Contains(t, perr.Error(), "Permissions Violation for Subscription")
+	case <-time.After(time.Second):
+		t.Fatal("expected removed subscription permission error")
+	}
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		acc, err := s.LookupAccount(accPub)
+		if err != nil {
+			return err
+		}
+		r := acc.sl.Match("foo")
+		// The second user in the same account is intentionally unaffected.
+		if len(r.psubs) != 1 || len(r.qsubs) != 0 {
+			return fmt.Errorf("expected exactly the other user's foo interest, got %d psubs/%d qsubs", len(r.psubs), len(r.qsubs))
+		}
+		return nil
+	})
+
+	require_NoError(t, nc.Publish("foo", []byte("denied")))
+	require_NoError(t, nc.Flush())
+	select {
+	case perr := <-errCh:
+		require_Contains(t, perr.Error(), "Permissions Violation for Publish")
+	case <-time.After(time.Second):
+		t.Fatal("expected publish permission error")
+	}
+	select {
+	case m := <-msgCh:
+		t.Fatalf("old subscription received message %q", m.Data)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require_NoError(t, otherNC.Publish("foo", []byte("other-user-allowed")))
+	otherMsg, err := otherSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, string(otherMsg.Data), "other-user-allowed")
+
+	auditMsg, err := auditSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	var audit map[string]any
+	require_NoError(t, json.Unmarshal(auditMsg.Data, &audit))
+	require_True(t, audit["source"] == string(AuthzSourceUserUpdate))
+	require_Equal(t, int(audit["affected_connections"].(float64)), 1)
+	require_True(t, audit["user"] == userPub)
+	auditRaw := string(auditMsg.Data)
+	require_False(t, strings.Contains(auditRaw, narrowedJWT))
+	require_False(t, strings.Contains(auditRaw, string(userSeed)))
+
+	widened := jwt.NewUserClaims(userPub)
+	widened.Permissions.Pub.Allow.Add("foo", "bar")
+	widened.Permissions.Sub.Allow.Add("foo", "bar")
+	widenedJWT, err := widened.Encode(accKP)
+	require_NoError(t, err)
+	_, err = sysNC.Request(fmt.Sprintf(accUpdateEventSubjNew, accPub), []byte(widenedJWT), time.Second)
+	require_NoError(t, err)
+
+	newSub, err := nc.SubscribeSync("foo")
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+	require_NoError(t, nc.Publish("foo", []byte("allowed")))
+	msg, err := newSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, string(msg.Data), "allowed")
+
+	// Reconnecting with the original old JWT must retain the server's newest policy.
+	nc.Close()
+	nc2, err := nats.Connect(s.ClientURL(),
+		nats.UserCredentials(userCreds),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			select {
+			case errCh <- err:
+			default:
+			}
+		}),
+	)
+	require_NoError(t, err)
+	defer nc2.Close()
+	reconnectedSub, err := nc2.SubscribeSync("bar")
+	require_NoError(t, err)
+	require_NoError(t, nc2.Flush())
+	require_NoError(t, nc2.Publish("bar", []byte("new-policy")))
+	msg, err = reconnectedSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, string(msg.Data), "new-policy")
+}
+
+func TestJWTUserClaimUpdateAppliesAcrossCluster(t *testing.T) {
+	s, _, sb, _, sysKP := runTrustedCluster(t)
+	defer s.Shutdown()
+	defer sb.Shutdown()
+
+	sysCreds := newUser(t, sysKP)
+	acc, accKP := createAccount(s)
+	accPub := acc.Name
+
+	userKP, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	userPub, err := userKP.PublicKey()
+	require_NoError(t, err)
+	userSeed, err := userKP.Seed()
+	require_NoError(t, err)
+	uc := jwt.NewUserClaims(userPub)
+	uc.Permissions.Sub.Allow.Add("foo")
+	uc.Permissions.Pub.Allow.Add("foo")
+	ujwt, err := uc.Encode(accKP)
+	require_NoError(t, err)
+	creds := genCredsFile(t, ujwt, userSeed)
+
+	errCh := make(chan error, 2)
+	userNC, err := nats.Connect(sb.ClientURL(), nats.UserCredentials(creds),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			select {
+			case errCh <- err:
+			default:
+			}
+		}))
+	require_NoError(t, err)
+	defer userNC.Close()
+	_, err = userNC.Subscribe("foo", func(_ *nats.Msg) {})
+	require_NoError(t, err)
+	require_NoError(t, userNC.Flush())
+
+	sysNC, err := nats.Connect(s.ClientURL(), nats.UserCredentials(sysCreds))
+	require_NoError(t, err)
+	defer sysNC.Close()
+
+	narrowed := jwt.NewUserClaims(userPub)
+	narrowed.Permissions.Sub.Allow.Add("bar")
+	narrowed.Permissions.Pub.Allow.Add("bar")
+	newJWT, err := narrowed.Encode(accKP)
+	require_NoError(t, err)
+	subject := fmt.Sprintf("$SYS.REQ.ACCOUNT.%s.USER.%s.CLAIMS.UPDATE", accPub, userPub)
+	_, err = sysNC.Request(subject, []byte(newJWT), 2*time.Second)
+	require_NoError(t, err)
+
+	select {
+	case perr := <-errCh:
+		require_Contains(t, perr.Error(), "Permissions Violation for Subscription")
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected remote node to prune subscription")
+	}
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		remoteAcc, err := sb.LookupAccount(accPub)
+		if err != nil {
+			return err
+		}
+		r := remoteAcc.sl.Match("foo")
+		if len(r.psubs) != 0 {
+			return fmt.Errorf("remote account still has foo interest")
+		}
+		return nil
+	})
+}
+
+func TestJWTUserClaimUpdateRejectsOrdinaryUserAndAudits(t *testing.T) {
+	okp, err := nkeys.FromSeed(oSeed)
+	require_NoError(t, err)
+	opPub, err := okp.PublicKey()
+	require_NoError(t, err)
+
+	sysKP, sysPub := createKey(t)
+	sysJWT := encodeClaim(t, jwt.NewAccountClaims(sysPub), sysPub)
+	sysCreds := newUser(t, sysKP)
+	accKP, accPub := createKey(t)
+	accJWT := encodeClaim(t, jwt.NewAccountClaims(accPub), accPub)
+	resolver := &MemAccResolver{}
+	require_NoError(t, resolver.Store(sysPub, sysJWT))
+	require_NoError(t, resolver.Store(accPub, accJWT))
+
+	opts := DefaultOptions()
+	opts.TrustedKeys = []string{opPub}
+	opts.SystemAccount = sysPub
+	opts.AccountResolver = resolver
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	userNC, err := nats.Connect(s.ClientURL(), nats.UserCredentials(newUser(t, accKP)))
+	require_NoError(t, err)
+	defer userNC.Close()
+
+	sysNC, err := nats.Connect(s.ClientURL(), nats.UserCredentials(sysCreds))
+	require_NoError(t, err)
+	defer sysNC.Close()
+	auditSub, err := sysNC.SubscribeSync(fmt.Sprintf("$SYS.ACCOUNT.%s.AUTH.POLICY.UPDATE", accPub))
+	require_NoError(t, err)
+	require_NoError(t, sysNC.Flush())
+
+	resp, err := userNC.Request(userClaimsUpdateSubj, []byte("not-a-jwt"), time.Second)
+	require_NoError(t, err)
+	var updateResp ServerAPIClaimUpdateResponse
+	require_NoError(t, json.Unmarshal(resp.Data, &updateResp))
+	require_True(t, updateResp.Error != nil)
+	require_Equal(t, updateResp.Error.Code, 403)
+
+	auditMsg, err := auditSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	var audit AuthzAuditEvent
+	require_NoError(t, json.Unmarshal(auditMsg.Data, &audit))
+	require_Equal(t, string(audit.Reason), string(AuthzReasonUnauthorizedSubmitter))
+	require_Equal(t, audit.Account, accPub)
+	require_False(t, audit.Effective)
+}

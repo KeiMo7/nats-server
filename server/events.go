@@ -1292,6 +1292,26 @@ func (s *Server) initEventTracking() {
 			}
 		}
 	}
+	// User claim updates use the same system request/response and forwarded
+	// interest semantics as account claim updates.
+	for _, sub := range []string{
+		accClaimsReqSubj,
+		userClaimsUpdateSubj,
+		userClaimsUpdatePlural,
+		userClaimsUpdateSubjID,
+		userClaimsUpdatePluralID,
+		acctUserClaimsUpdate,
+		acctUserClaimUpdate,
+		acctUserClaimsUpdateID,
+		acctUserClaimsPluralID,
+		acctOldUserClaimUpdate,
+		acctOldUserClaimsUpdateID,
+	} {
+		if _, err := s.sysSubscribe(sub, s.noInlineCallback(s.userClaimUpdate)); err != nil {
+			s.Errorf("Error setting up user claim update handler for %q: %v", sub, err)
+			return
+		}
+	}
 	// Listen for ping messages that will be sent to all servers for statsz.
 	// This subscription is kept for backwards compatibility. Got replaced by ...PING.STATZ from below
 	if _, err := s.sysSubscribe(serverStatsPingReqSubj, s.noInlineCallbackStatsz(s.statszReq)); err != nil {
@@ -1688,6 +1708,17 @@ func (s *Server) accountClaimUpdate(sub *subscription, c *client, _ *Account, su
 		err := errors.New("request body is empty")
 		respondToUpdate(s, resp, pubKey, "jwt update error", err)
 	} else if claim, err := jwt.DecodeAccountClaims(string(msg)); err != nil {
+		// The established claims-update subject is also a valid entrypoint for
+		// user claims. Route those through the unified user policy evaluator
+		// instead of reporting a claim-type decode error.
+		if userClaim, userErr := jwt.DecodeUserClaims(string(msg)); userErr == nil {
+			if _, applyErr := s.ApplyUserClaimJWTForAccount(string(msg), pubKey); applyErr != nil {
+				respondToUpdate(s, resp, userClaim.Subject, "user jwt update resulted in error", applyErr)
+			} else {
+				respondToUpdate(s, resp, userClaim.Subject, "user jwt updated", nil)
+			}
+			return
+		}
 		respondToUpdate(s, resp, pubKey, "jwt update resulted in error", err)
 	} else if claim.Subject != pubKey {
 		err := errors.New("subject does not match jwt content")

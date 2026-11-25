@@ -4583,6 +4583,12 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 		return false, true
 	}
 
+	// User claim updates have a system-account trust boundary. Reject attempts
+	// made inside a user account before ordinary subject routing/imports.
+	if c.rejectUnauthorizedUserClaimUpdate() {
+		return false, true
+	}
+
 	// Mostly under testing scenarios.
 	c.mu.Lock()
 	if c.srv == nil || c.acc == nil {
